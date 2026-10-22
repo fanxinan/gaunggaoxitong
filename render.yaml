@@ -1,0 +1,32 @@
+# Review the platform's price before creating this paid persistent-disk service.
+services:
+  - type: web
+    name: zhouce
+    runtime: docker
+    plan: starter
+    numInstances: 1
+    autoDeploy: false
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    disk:
+      name: zhouce-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: "10000"
+      - key: WEEKLY_DATA_DIR
+        value: /data
+      - key: WEEKLY_REQUIRE_AUTH
+        value: "1"
+      - key: WEEKLY_COOKIE_SECURE
+        value: "true"
+      - key: WEEKLY_ACCESS_PASSWORD
+        sync: false
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      - key: DEEPSEEK_MODEL
+        value: deepseek-chat
+      - key: DEEPSEEK_BASE_URL
+        value: https://api.deepseek.com

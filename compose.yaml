@@ -1,0 +1,30 @@
+name: zhouce
+
+services:
+  web:
+    build: .
+    image: zhouce:local
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 90s
+    environment:
+      PORT: "8000"
+      WEEKLY_DATA_DIR: /data
+      WEEKLY_REQUIRE_AUTH: "1"
+      WEEKLY_ACCESS_PASSWORD: ${WEEKLY_ACCESS_PASSWORD:?请在服务器安全环境中设置至少16字符的登录密码}
+      WEEKLY_COOKIE_SECURE: "true"
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+    ports:
+      - "127.0.0.1:${WEEKLY_HOST_PORT:-8000}:8000"
+    volumes:
+      - weekly-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  weekly-data:

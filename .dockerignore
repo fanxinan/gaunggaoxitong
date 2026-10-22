@@ -1,0 +1,10 @@
+**
+!Dockerfile
+!requirements.txt
+!*.py
+!frontend/
+!frontend/static/
+!frontend/static/index.html
+!frontend/static/login.html
+!frontend/static/styles.css
+!frontend/static/app.js
