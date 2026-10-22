@@ -9,14 +9,14 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import sqlite3
 import tempfile
 import uuid
 import zipfile
+from typing import Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
@@ -26,11 +26,24 @@ from starlette.background import BackgroundTask
 from parser import parse_report
 from analysis_engine import analyze_report
 from ai_review import review_analysis, ai_configuration
-from access_control import install_access_control
+from access_control import install_access_control, request_language
+from localized_analysis import localize_analysis, translate_message
 
 BASE = Path(__file__).resolve().parent
 MAX_UPLOAD = 15 * 1024 * 1024
 DEFAULT_SETTINGS = {'target_acos': 24.0, 'growth_priority': True, 'inventory_threshold': 3}
+MARKETPLACES = {
+    'AE': {'code': 'AE', 'name_zh': '阿联酋', 'name_en': 'United Arab Emirates', 'currency': 'AED'},
+    'SA': {'code': 'SA', 'name_zh': '沙特阿拉伯', 'name_en': 'Saudi Arabia', 'currency': 'SAR'},
+}
+Language = Literal['zh', 'en']
+
+
+def market_code(value: str) -> str:
+    code = value.strip().upper()
+    if code not in MARKETPLACES:
+        raise HTTPException(422, '仅支持阿联酋站点AE和沙特站点SA')
+    return code
 
 
 def now():
@@ -85,6 +98,9 @@ def create_app(data_dir: str | Path | None = None):
         con.execute('PRAGMA journal_mode=WAL')
         con.executescript('''
             CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS market_settings (
+                marketplace TEXT PRIMARY KEY CHECK(marketplace IN ('AE','SA')), value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS reports (
                 id TEXT PRIMARY KEY, filename TEXT NOT NULL, sha256 TEXT NOT NULL,
                 marketplace TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL,
@@ -107,6 +123,9 @@ def create_app(data_dir: str | Path | None = None):
             CREATE INDEX IF NOT EXISTS confirmation_asin ON confirmations(asin,executed_at);
         ''')
         con.execute('INSERT OR IGNORE INTO settings VALUES(1,?)', (dumps(DEFAULT_SETTINGS),))
+        legacy_settings = con.execute('SELECT value FROM settings WHERE id=1').fetchone()[0]
+        con.execute('INSERT OR IGNORE INTO market_settings VALUES(?,?)', ('AE', legacy_settings))
+        con.execute('INSERT OR IGNORE INTO market_settings VALUES(?,?)', ('SA', dumps(DEFAULT_SETTINGS)))
         # A process restart cannot resume an in-memory upstream request. Preserve the snapshot.
         for a in con.execute('SELECT id,result_json FROM analyses').fetchall():
             result = json.loads(a['result_json'])
@@ -114,9 +133,14 @@ def create_app(data_dir: str | Path | None = None):
                 result['ai_review'].update(status='failed', error='服务重启中断了AI复核。原始报告与规则分析已保留，可重新分析。')
                 con.execute('UPDATE analyses SET result_json=? WHERE id=?', (dumps(result), a['id']))
 
-    app = FastAPI(title='周策 · 广告经营复盘', version='0.1.0')
+    app = FastAPI(title='周策 · 广告经营复盘', version='0.2.0')
     app.state.store = store
     install_access_control(app)
+
+    @app.exception_handler(HTTPException)
+    async def localized_http_error(request: Request, exc: HTTPException):
+        detail = translate_message(exc.detail, request_language(request)) if isinstance(exc.detail, str) else exc.detail
+        return JSONResponse({'detail': detail}, status_code=exc.status_code, headers=exc.headers)
 
     @app.middleware('http')
     async def same_origin(request, call_next):
@@ -124,7 +148,7 @@ def create_app(data_dir: str | Path | None = None):
         if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'} and origin:
             from urllib.parse import urlparse
             if urlparse(origin).netloc != request.headers.get('host'):
-                return JSONResponse({'detail': '不接受跨站修改请求'}, status_code=403)
+                return JSONResponse({'detail': translate_message('不接受跨站修改请求', request_language(request))}, status_code=403)
         response = await call_next(request)
         response.headers['X-Content-Type-Options'] = 'nosniff'
         response.headers['Referrer-Policy'] = 'same-origin'
@@ -132,9 +156,10 @@ def create_app(data_dir: str | Path | None = None):
             response.headers['Cache-Control'] = 'no-store'
         return response
 
-    def settings_value():
+    def settings_value(marketplace='AE'):
+        marketplace = market_code(marketplace)
         with db() as con:
-            return json.loads(con.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+            return json.loads(con.execute('SELECT value FROM market_settings WHERE marketplace=?', (marketplace,)).fetchone()[0])
 
     def full_report(report_id):
         with db() as con:
@@ -152,20 +177,29 @@ def create_app(data_dir: str | Path | None = None):
         result = json.loads(a['result_json']) if a else {}
         status = result.get('ai_review', {}).get('status', 'unavailable')
         return {'id': r['id'], 'filename': r['filename'], 'marketplace': r['marketplace'],
+                'currency': MARKETPLACES.get(r['marketplace'], {}).get('currency'),
                 'start_date': r['period_start'], 'end_date': r['period_end'], 'day_count': r['days'],
                 'created_at': r['created_at'], 'row_count': r['row_count'],
                 'analysis_id': a['id'] if a else None, 'ai_status': status,
                 'analysis_status': 'reviewing' if status == 'pending' else 'ready'}
 
-    def confirmations(report_id=None):
+    def confirmations(report_id=None, marketplace=None):
+        clauses, values = [], []
+        if report_id:
+            clauses.append('c.report_id=?')
+            values.append(report_id)
+        if marketplace is not None:
+            clauses.append('r.marketplace=?')
+            values.append(market_code(marketplace))
+        query = 'SELECT c.*,r.marketplace FROM confirmations c JOIN reports r ON r.id=c.report_id'
+        if clauses:
+            query += ' WHERE ' + ' AND '.join(clauses)
+        query += ' ORDER BY c.executed_at DESC'
         with db() as con:
-            if report_id:
-                rows = con.execute('SELECT * FROM confirmations WHERE report_id=? ORDER BY executed_at DESC', (report_id,)).fetchall()
-            else:
-                rows = con.execute('SELECT * FROM confirmations ORDER BY executed_at DESC').fetchall()
+            rows = con.execute(query, values).fetchall()
         return [dict(r) for r in rows]
 
-    def get_analysis(report_id, analysis_id=None):
+    def get_analysis(report_id, analysis_id=None, lang='zh'):
         r = full_report(report_id)
         with db() as con:
             if analysis_id:
@@ -181,7 +215,7 @@ def create_app(data_dir: str | Path | None = None):
                            analysis_status='reviewing' if selected_ai_status == 'pending' else 'ready')
         result.update(id=a['id'], report_id=report_id, created_at=a['created_at'], report=report_meta,
                       settings_snapshot=json.loads(a['settings_json']), confirmations=confirmations(report_id))
-        return result
+        return localize_analysis(result, lang)
 
     async def enrich(analysis_id, result, report, previous, events, settings):
         try:
@@ -194,9 +228,9 @@ def create_app(data_dir: str | Path | None = None):
         with db() as con:
             con.execute('UPDATE analyses SET result_json=? WHERE id=?', (dumps(result), analysis_id))
 
-    def create_analysis(report_id, background: BackgroundTasks):
+    def create_analysis(report_id, background: BackgroundTasks, lang='zh'):
         report = full_report(report_id)
-        settings = settings_value()
+        settings = settings_value(report['marketplace'])
         with db() as con:
             ids = [row[0] for row in con.execute('SELECT id FROM reports WHERE marketplace=? AND id<>? ORDER BY period_end DESC', (report['marketplace'], report_id))]
         previous = [full_report(i) for i in ids]
@@ -216,39 +250,55 @@ def create_app(data_dir: str | Path | None = None):
             con.execute('INSERT INTO analyses VALUES(?,?,?,?,?)', (aid, report_id, created, dumps(settings), dumps(result)))
         if configured:
             background.add_task(enrich, aid, result, report, previous, events, settings)
-        return get_analysis(report_id, aid)
+        return get_analysis(report_id, aid, lang)
 
     @app.get('/api/health')
     def health():
-        return {'status': 'ok', 'storage': 'SQLite', 'ai_configured': ai_configuration()['configured']}
+        return {'status': 'ok', 'storage': 'SQLite', 'ai_configured': ai_configuration()['configured'], 'version': app.version}
+
+    @app.get('/api/marketplaces')
+    def list_marketplaces():
+        return {'marketplaces': list(MARKETPLACES.values())}
 
     @app.get('/api/settings')
-    def get_settings():
-        value = settings_value()
+    def get_settings(marketplace: str = 'AE', lang: Language = 'zh'):
+        marketplace = market_code(marketplace)
+        value = settings_value(marketplace)
         value.update(ai=ai_configuration(),
                      storage={'type': 'SQLite', 'persistent': True},
-                     access={'enabled': app.state.access_control_enabled})
+                     access={'enabled': app.state.access_control_enabled},
+                     marketplace=marketplace, currency=MARKETPLACES[marketplace]['currency'])
+        if value['ai'].get('reason'):
+            value['ai']['reason'] = translate_message(value['ai']['reason'], lang)
         return value
 
     @app.put('/api/settings')
-    def put_settings(body: SettingsInput):
+    def put_settings(body: SettingsInput, marketplace: str = 'AE', lang: Language = 'zh'):
+        marketplace = market_code(marketplace)
         value = {**body.model_dump(), 'inventory_threshold': 3}
         with db() as con:
-            con.execute('UPDATE settings SET value=? WHERE id=1', (dumps(value),))
-        return get_settings()
+            con.execute('UPDATE market_settings SET value=? WHERE marketplace=?', (dumps(value), marketplace))
+            if marketplace == 'AE':
+                con.execute('UPDATE settings SET value=? WHERE id=1', (dumps(value),))
+        return get_settings(marketplace, lang)
 
     @app.get('/api/reports')
-    def list_reports():
+    def list_reports(marketplace: str | None = None):
+        marketplace = market_code(marketplace) if marketplace is not None else None
         with db() as con:
-            reports = [dict(r) for r in con.execute('SELECT * FROM reports ORDER BY created_at DESC')]
+            query = 'SELECT * FROM reports'
+            values = []
+            if marketplace:
+                query += ' WHERE marketplace=?'
+                values.append(marketplace)
+            reports = [dict(r) for r in con.execute(query + ' ORDER BY created_at DESC', values)]
         return {'reports': [meta(r) for r in reports]}
 
     @app.post('/api/reports')
     async def upload_report(background_tasks: BackgroundTasks, file: UploadFile = File(...),
-                            marketplace: str = Form(...), start_date: str = Form(...), end_date: str = Form(...)):
-        marketplace = marketplace.strip().upper()
-        if not re.fullmatch(r'[A-Z]{2,4}', marketplace):
-            raise HTTPException(422, '站点需为AE、US等代码')
+                            marketplace: str = Form(...), start_date: str = Form(...), end_date: str = Form(...),
+                            lang: Language = 'zh'):
+        marketplace = market_code(marketplace)
         try:
             start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
         except ValueError:
@@ -277,9 +327,9 @@ def create_app(data_dir: str | Path | None = None):
         if existing:
             rid = existing[0]
             try:
-                analysis = get_analysis(rid)
+                analysis = get_analysis(rid, lang=lang)
             except HTTPException:
-                analysis = create_analysis(rid, background_tasks)
+                analysis = create_analysis(rid, background_tasks, lang)
             return {'report': meta(full_report(rid)), 'analysis': analysis, 'duplicate': True}
         rid = uuid.uuid4().hex
         path = uploads / f'{rid}.xlsx'
@@ -292,12 +342,12 @@ def create_app(data_dir: str | Path | None = None):
         except Exception:
             path.unlink(missing_ok=True)
             raise
-        analysis = create_analysis(rid, background_tasks)
+        analysis = create_analysis(rid, background_tasks, lang)
         return {'report': meta(full_report(rid)), 'analysis': analysis, 'duplicate': False}
 
     @app.get('/api/reports/{report_id}/analysis')
-    def latest_analysis(report_id: str):
-        return get_analysis(report_id)
+    def latest_analysis(report_id: str, lang: Language = 'zh'):
+        return get_analysis(report_id, lang=lang)
 
     @app.get('/api/reports/{report_id}/analyses')
     def analyses(report_id: str):
@@ -307,12 +357,12 @@ def create_app(data_dir: str | Path | None = None):
         return {'analyses': [{'id': r['id'], 'created_at': r['created_at'], 'ai_status': json.loads(r['result_json']).get('ai_review', {}).get('status')} for r in values]}
 
     @app.get('/api/reports/{report_id}/analyses/{analysis_id}')
-    def historical_analysis(report_id: str, analysis_id: str):
-        return get_analysis(report_id, analysis_id)
+    def historical_analysis(report_id: str, analysis_id: str, lang: Language = 'zh'):
+        return get_analysis(report_id, analysis_id, lang)
 
     @app.post('/api/reports/{report_id}/analyze')
-    def reanalyze(report_id: str, background_tasks: BackgroundTasks):
-        return {'analysis': create_analysis(report_id, background_tasks)}
+    def reanalyze(report_id: str, background_tasks: BackgroundTasks, lang: Language = 'zh'):
+        return {'analysis': create_analysis(report_id, background_tasks, lang)}
 
     @app.get('/api/reports/{report_id}/download')
     def download_original(report_id: str):
@@ -320,23 +370,26 @@ def create_app(data_dir: str | Path | None = None):
         return FileResponse(uploads / f'{report_id}.xlsx', filename=report['filename'], media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
     @app.get('/api/reports/{report_id}/export')
-    def export_analysis(report_id: str, analysis_id: str | None = None):
-        analysis = get_analysis(report_id, analysis_id)
+    def export_analysis(report_id: str, analysis_id: str | None = None, lang: Language = 'zh'):
+        analysis = get_analysis(report_id, analysis_id, lang)
+        english = lang == 'en'
         workbook = Workbook()
         overview = workbook.active
-        overview.title = '分析概况'
-        overview.append(['项目', '内容'])
+        overview.title = 'Overview' if english else '分析概况'
+        overview.append(['Field', 'Value'] if english else ['项目', '内容'])
         for key, value in analysis['summary'].items():
             overview.append([key, safe_excel(dumps(value) if isinstance(value, (dict, list)) else value)])
-        overview.append(['分析版本', analysis['id']])
-        overview.append(['AI复核状态', analysis['ai_review']['status']])
-        overview.append(['AI复核摘要', safe_excel(analysis['ai_review'].get('summary', ''))])
-        sheet = workbook.create_sheet('逐品建议')
-        sheet.append(['ASIN', '产品', '当前目标', '建议目标', '是否有可执行建议', '动作', '理由', '广告花费', '广告销售', '广告ACOS', '订单', '库存', '证据', '异常及排查'])
+        overview.append(['Analysis version' if english else '分析版本', analysis['id']])
+        overview.append(['Marketplace' if english else '站点', analysis['report']['marketplace']])
+        overview.append(['Currency' if english else '币种', analysis['report'].get('currency')])
+        overview.append(['AI review status' if english else 'AI复核状态', analysis['ai_review']['status']])
+        overview.append(['AI review summary (original language)' if english else 'AI复核摘要', safe_excel(analysis['ai_review'].get('summary', ''))])
+        sheet = workbook.create_sheet('Recommendations' if english else '逐品建议')
+        sheet.append(['ASIN', 'Product', 'Current target', 'Suggested target', 'Actionable', 'Action', 'Reason', 'Ad spend', 'Ad sales', 'Ad ACOS', 'Orders', 'Inventory', 'Evidence', 'Issues and checks'] if english else ['ASIN', '产品', '当前目标', '建议目标', '是否有可执行建议', '动作', '理由', '广告花费', '广告销售', '广告ACOS', '订单', '库存', '证据', '异常及排查'])
         for r in analysis['recommendations']:
             metrics = r.get('metrics', {})
             vals = [r['asin'], r.get('name'), r.get('current_target'), r.get('recommended_target'),
-                    '是' if r.get('actionable') else '否', r.get('action_label'), r.get('reason'),
+                    ('Yes' if r.get('actionable') else 'No') if english else ('是' if r.get('actionable') else '否'), r.get('action_label'), r.get('reason'),
                     metrics.get('spend'), metrics.get('ad_sales'), metrics.get('acos'), metrics.get('orders'),
                     metrics.get('inventory'), '\n'.join(r.get('evidence', [])), dumps(r.get('anomalies', []))]
             sheet.append([safe_excel(v) for v in vals])
@@ -345,11 +398,12 @@ def create_app(data_dir: str | Path | None = None):
         work = Path(tempfile.mkdtemp(prefix='weekly-export-'))
         dest = work / 'analysis.xlsx'
         workbook.save(dest)
-        return FileResponse(dest, filename=f"周策分析_{analysis['report']['marketplace']}_{analysis['report']['end_date']}.xlsx", background=BackgroundTask(shutil.rmtree, work))
+        prefix = 'Zhouce_analysis' if english else '周策分析'
+        return FileResponse(dest, filename=f"{prefix}_{analysis['report']['marketplace']}_{analysis['report']['end_date']}.xlsx", background=BackgroundTask(shutil.rmtree, work))
 
     @app.get('/api/confirmations')
-    def list_confirmations():
-        return {'confirmations': confirmations()}
+    def list_confirmations(marketplace: str | None = None):
+        return {'confirmations': confirmations(marketplace=marketplace)}
 
     @app.post('/api/reports/{report_id}/confirmations')
     def confirm(report_id: str, body: ConfirmationInput):

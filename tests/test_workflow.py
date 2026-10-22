@@ -172,7 +172,7 @@ class WeeklyWorkflowTests(unittest.TestCase):
     def test_overlapping_or_other_market_periods_do_not_compare(self):
         self.saved(start=self.start - timedelta(days=2), end=self.end - timedelta(days=2))
         prior_end = self.start - timedelta(days=1)
-        self.saved(start=prior_end - timedelta(days=6), end=prior_end, marketplace='US')
+        self.saved(start=prior_end - timedelta(days=6), end=prior_end, marketplace='SA')
         current = self.saved()
         self.assertFalse(current['analysis']['comparison']['available'])
 
@@ -205,7 +205,7 @@ class WeeklyWorkflowTests(unittest.TestCase):
         self.assertFalse(execution['complete_post_change_period'])
         self.assertTrue(execution['blocks_new_change'])
         self.assertFalse(recommendation['actionable'])
-        other_market = self.saved(marketplace='US')
+        other_market = self.saved(marketplace='SA')
         other_execution = other_market['analysis']['recommendations'][0]['history']['execution']
         self.assertFalse(other_execution['has_confirmation'])
 

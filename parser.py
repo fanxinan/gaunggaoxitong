@@ -68,7 +68,7 @@ def _numeric(value: Any, key: str, row: int, number_format: str = "") -> float |
         cleaned = str(value).strip().replace(",", "").replace("，", "")
         if key == "target":
             cleaned = re.sub(r"^自定义\s*", "", cleaned)
-        match = re.match(r"^(?:[≤≥<>]=?\s*|(?:AED|USD)\s*|[$¥￥]\s*)?(-?\d+(?:\.\d+)?)\s*(?:%|％)?(?:\s|\(|（|$)", cleaned)
+        match = re.match(r"^(?:[≤≥<>]=?\s*|(?:AED|SAR|USD)\s*|[$¥￥]\s*)?(-?\d+(?:\.\d+)?)\s*(?:%|％)?(?:\s|\(|（|$)", cleaned)
         if not match:
             raise ReportParseError(f"第{row}行的{key}无法解析：请保留DeepBI原始数字格式。")
         result = float(match.group(1))
